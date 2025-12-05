@@ -22,13 +22,13 @@ extern HdlEntry*    db2AllocStmtHdl      (SQLSMALLINT type, DB2ConnEntry* connp,
 extern void         db2FreeStmtHdl       (HdlEntry* handlep, DB2ConnEntry* connp);
 
 /** internal prototypes */
-int                 db2GetImportColumn   (DB2Session* session, char* schema, char* table_list, int list_type, char* tabname, char* colName, short* colType, size_t* colLen, short* colScale, short* colNulls, int* key, int* cp);
+int                 db2GetImportColumn   (DB2Session* session, char* schema, char* table_list, int list_type, char* tabname, char* colName, short* colType, size_t* colLen, short* colScale, short* colNulls, int* key, int* cp, char** colDefault);
 
 /** db2GetImportColumn
  *   Get the next element in the ordered list of tables and their columns for "schema".
  *   Returns 0 if there are no more columns, -1 if the remote schema does not exist, else 1.
  */
-int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int list_type, char* tabname, char* colName, short* colType, size_t* colLen, short* colScale, short* colNulls, int* key, int* cp) {
+int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int list_type, char* tabname, char* colName, short* colType, size_t* colLen, short* colScale, short* colNulls, int* key, int* cp, char** colDefault) {
   /* the static variables will contain data returned to the caller */
   SQLCHAR      tab_buf [TABLE_NAME_LEN];
   SQLLEN       ind_tab;
@@ -46,6 +46,8 @@ int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int 
   SQLLEN       ind_key;
   SQLSMALLINT  cp_val;
   SQLLEN       ind_cp;
+  static SQLCHAR default_buf[1024];  /* Buffer for default value */
+  SQLLEN       ind_default;
   SQLRETURN    result         = 0;
 
   db2Debug1("> db2GetImportCol");
@@ -128,7 +130,7 @@ int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int 
 
     switch(list_type){
       case 0: {   /* FDW_IMPORT_SCHEMA_ALL      */
-        char* query_str = "SELECT T.TABNAME, C.COLNAME, C.TYPENAME, C.LENGTH, C.SCALE, C.NULLS, COALESCE(C.KEYSEQ, 0) AS KEY, C.CODEPAGE"
+        char* query_str = "SELECT T.TABNAME, C.COLNAME, C.TYPENAME, C.LENGTH, C.SCALE, C.NULLS, COALESCE(C.KEYSEQ, 0) AS KEY, C.CODEPAGE, C.DEFAULT"
                           " FROM SYSCAT.TABLES T JOIN SYSCAT.COLUMNS C ON T.TABSCHEMA = C.TABSCHEMA AND T.TABNAME   = C.TABNAME"
                           " WHERE T.TABSCHEMA = ? AND T.TYPE IN ('T','V') ORDER BY T.TABNAME, C.COLNO";
         int   s_len     = strlen(query_str)+1;
@@ -137,7 +139,7 @@ int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int 
       }
       break;
       case 1: {   /* FDW_IMPORT_SCHEMA_LIMIT_TO */
-        char* query_str = "SELECT T.TABNAME, C.COLNAME, C.TYPENAME, C.LENGTH, C.SCALE, C.NULLS, COALESCE(C.KEYSEQ, 0) AS KEY, C.CODEPAGE"
+        char* query_str = "SELECT T.TABNAME, C.COLNAME, C.TYPENAME, C.LENGTH, C.SCALE, C.NULLS, COALESCE(C.KEYSEQ, 0) AS KEY, C.CODEPAGE, C.DEFAULT"
                           " FROM SYSCAT.TABLES T JOIN SYSCAT.COLUMNS C ON T.TABSCHEMA = C.TABSCHEMA AND T.TABNAME   = C.TABNAME"
                           " WHERE T.TABSCHEMA = ? AND T.TYPE IN ('T','V') AND T.TABNAME IN (%s) ORDER BY T.TABNAME, C.COLNO";
         int   s_len     = strlen(query_str) + strlen(table_list) + 1;
@@ -146,7 +148,7 @@ int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int 
       }
       break;
       case 2: {   /* FDW_IMPORT_SCHEMA_EXCEPT   */
-        char* query_str = "SELECT T.TABNAME, C.COLNAME, C.TYPENAME, C.LENGTH, C.SCALE, C.NULLS, COALESCE(C.KEYSEQ, 0) AS KEY, C.CODEPAGE"
+        char* query_str = "SELECT T.TABNAME, C.COLNAME, C.TYPENAME, C.LENGTH, C.SCALE, C.NULLS, COALESCE(C.KEYSEQ, 0) AS KEY, C.CODEPAGE, C.DEFAULT"
                           " FROM SYSCAT.TABLES T JOIN SYSCAT.COLUMNS C ON T.TABSCHEMA = C.TABSCHEMA AND T.TABNAME   = C.TABNAME"
                           " WHERE T.TABSCHEMA = ? AND T.TYPE IN ('T','V') AND T.TABNAME NOT IN (%s) ORDER BY T.TABNAME, C.COLNO";
         int   s_len     = strlen(query_str) + strlen(table_list) + 1;
@@ -232,7 +234,14 @@ int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int 
     db2Debug2("  SQLBindCol8 rc : %d",result);
     result = db2CheckErr(result, session->stmtp->hsql, session->stmtp->type,  __LINE__, __FILE__);
     if (result != SQL_SUCCESS) {
-      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error importing foreign schema: SQLBindCol failed to define result for type scale", db2Message);
+      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error importing foreign schema: SQLBindCol failed to define result for codepage", db2Message);
+    }
+
+    result = SQLBindCol(session->stmtp->hsql, 9, SQL_C_CHAR, default_buf, sizeof(default_buf), &ind_default);
+    db2Debug2("  SQLBindCol9 rc : %d",result);
+    result = db2CheckErr(result, session->stmtp->hsql, session->stmtp->type,  __LINE__, __FILE__);
+    if (result != SQL_SUCCESS) {
+      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error importing foreign schema: SQLBindCol failed to define result for default value", db2Message);
     }
 
     /* execute the query and get the first result row */
@@ -272,6 +281,7 @@ int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int 
     db2Debug2("  isnull  : '%s', ind: %d", nulls_val , ind_nulls);
     db2Debug2("  key     : %d  , ind: %d", keyseq_val, ind_key  );
     db2Debug2("  codepage: %d  , ind: %d", cp_val    , ind_cp   );
+    db2Debug2("  default : '%s', ind: %d", default_buf, ind_default);
     if (ind_tab == SQL_NULL_DATA)
       tabname[0] = '\0';
     else
@@ -285,6 +295,7 @@ int db2GetImportColumn(DB2Session* session, char* schema, char* table_list, int 
     *colNulls  = (ind_nulls == SQL_NULL_DATA) ? 0 : (nulls_val[0] == 'Y');
     *key       = (ind_key   == SQL_NULL_DATA) ? 0 : (int) keyseq_val;
     *cp        = (ind_cp    == SQL_NULL_DATA) ? 0 : (int) cp_val;
+    *colDefault = (ind_default == SQL_NULL_DATA || ind_default == 0) ? NULL : (char*)default_buf;
     /* figure out correct data type */
          if (strcmp (typename, "VARCHAR"      ) == 0) *colType = SQL_VARCHAR;
     else if (strcmp (typename, "LONG VARCHAR" ) == 0 && *cp != 0) *colType = SQL_LONGVARCHAR;

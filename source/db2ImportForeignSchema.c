@@ -16,7 +16,7 @@
 
 /** external prototypes */
 extern DB2Session*  db2GetSession             (const char* connectstring, char* user, char* password, char* jwt_token, const char* nls_lang, int curlevel);
-extern int          db2GetImportColumn        (DB2Session* session, char* stmt, char* table_list, int list_type, char* tabname, char* colname, short* colType, size_t* colLen, short* typescale, short* nullable, int* key, int* cp);
+extern int          db2GetImportColumn        (DB2Session* session, char* stmt, char* table_list, int list_type, char* tabname, char* colname, short* colType, size_t* colLen, short* typescale, short* nullable, int* key, int* cp, char** colDefault);
 extern char*        guessNlsLang              (char* nls_lang);
 extern void         db2Debug1                 (const char* message, ...);
 extern void         db2Debug2                 (const char* message, ...);
@@ -52,6 +52,7 @@ List* db2ImportForeignSchema (ImportForeignSchemaStmt* stmt, Oid serverOid) {
   short               colNulls;
   int                 key;
   int                 cp;
+  char*               colDefault;
   int                 rc;
   List*               options;
   List*               result    = NIL;
@@ -156,7 +157,7 @@ List* db2ImportForeignSchema (ImportForeignSchemaStmt* stmt, Oid serverOid) {
   db2Debug2("  import table_list: '%s'",tblist.data);
   do {
     /* get the next column definition */
-    rc = db2GetImportColumn (session, stmt->remote_schema, tblist.data, stmt->list_type, tabname, colname, &colType, &colSize, &colScale, &colNulls, &key, &cp);
+    rc = db2GetImportColumn (session, stmt->remote_schema, tblist.data, stmt->list_type, tabname, colname, &colType, &colSize, &colScale, &colNulls, &key, &cp, &colDefault);
 
     if (rc == -1) {
       /* remote schema does not exist, issue a warning */
@@ -274,12 +275,37 @@ List* db2ImportForeignSchema (ImportForeignSchemaStmt* stmt, Oid serverOid) {
           appendStringInfo (&buf, "text");
           break;
       }
-      /* part of the primary key */
+      /* part of the primary key - OPTIONS must come before constraints */
       if (key)
         appendStringInfo (&buf, " OPTIONS (key 'true')");
       /* not nullable */
       if (!colNulls)
         appendStringInfo (&buf, " NOT NULL");
+      /* default value */
+      if (colDefault != NULL) {
+        /* Trim leading/trailing whitespace from default value */
+        char* trimmed = colDefault;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (*trimmed != '\0') {
+          /* Convert DB2 default expressions to PostgreSQL syntax */
+          /* DB2 uses "CURRENT TIMESTAMP" but PostgreSQL needs "CURRENT_TIMESTAMP" */
+          if (strcmp(trimmed, "CURRENT TIMESTAMP") == 0) {
+            appendStringInfo (&buf, " DEFAULT CURRENT_TIMESTAMP");
+          }
+          /* DB2 uses "CURRENT DATE" but PostgreSQL needs "CURRENT_DATE" */
+          else if (strcmp(trimmed, "CURRENT DATE") == 0) {
+            appendStringInfo (&buf, " DEFAULT CURRENT_DATE");
+          }
+          /* DB2 uses "CURRENT TIME" but PostgreSQL needs "CURRENT_TIME" */
+          else if (strcmp(trimmed, "CURRENT TIME") == 0) {
+            appendStringInfo (&buf, " DEFAULT CURRENT_TIME");
+          }
+          /* For other defaults, use as-is */
+          else {
+            appendStringInfo (&buf, " DEFAULT %s", trimmed);
+          }
+        }
+      }
     }
   } while (rc == 1);
   db2Debug1("< db2ImportForeignSchema");
