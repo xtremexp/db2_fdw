@@ -25,7 +25,7 @@ void             db2EndSubtransaction (void* arg, int nest_level, int is_commit)
  *   If "is_commit" is not true, rollback.
  */
 void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
-  SQLCHAR       query[50];
+  SQLCHAR       query[80];
   DB2ConnEntry* con    = (DB2ConnEntry*) arg;
   DB2ConnEntry* connp  = NULL;
   DB2EnvEntry*  envp   = NULL;
@@ -40,14 +40,6 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
 
   con->xact_level = nest_level - 1;
 
-  if (is_commit) {
-    /*
-     * There is nothing to do as savepoints don't get released in DB2:
-     * Setting the same savepoint again just overwrites the previous one.
-     */
-    return;
-  }
-
   /* find the cached handles for the argument */
   for (envp = rootenvEntry; envp != NULL; envp = envp->right) {
     for (connp = envp->connlist; connp != NULL; connp = connp->right) {
@@ -60,28 +52,68 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
 
   if (!found) {
     /* the code will abend since connp is null*/
-    db2Error (FDW_ERROR, "db2RollbackSavepoint internal error: handle not found in cache");
+    db2Error (FDW_ERROR, "db2EndSubtransaction internal error: handle not found in cache");
   }
 
-  db2Debug2("  rollback to savepoint s%d", nest_level);
-  snprintf  ((char*)query, 49, "ROLLBACK TO SAVEPOINT s%d", nest_level);
+  if (is_commit) {
+    /*
+     * Commit the remote subtransaction by releasing the savepoint.
+     * While DB2 automatically releases savepoints on transaction COMMIT,
+     * we should explicitly release them when subtransactions complete
+     * to free up resources.
+     */
+    db2Debug2("  release savepoint s%d", nest_level);
+    snprintf((char*)query, 79, "RELEASE SAVEPOINT s%d", nest_level);
+  } else {
+    /*
+     * Rollback the remote subtransaction.
+     * DB2 requires both ROLLBACK TO and RELEASE SAVEPOINT.
+     */
+    db2Debug2("  rollback to savepoint s%d and release", nest_level);
+    snprintf((char*)query, 79, "ROLLBACK TO SAVEPOINT s%d", nest_level);
+  }
 
   /* create statement handle */
-  hstmtp = db2AllocStmtHdl(SQL_HANDLE_STMT, connp, FDW_UNABLE_TO_CREATE_EXECUTION, "error rollback savepoint: SQLAllocHandle failed to obtain hstmt");
+  hstmtp = db2AllocStmtHdl(SQL_HANDLE_STMT, connp, FDW_UNABLE_TO_CREATE_EXECUTION, "error managing savepoint: SQLAllocHandle failed to obtain hstmt");
 
   /* prepare the query */
   rc = SQLPrepare(hstmtp->hsql, (SQLCHAR*)query, SQL_NTS);
-  rc = db2CheckErr(rc,hstmtp->hsql, hstmtp->type, __LINE__, __FILE__); 
+  rc = db2CheckErr(rc,hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
   if (rc != SQL_SUCCESS) {
-    db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error rollback savepoint: SQLPrepare failed to prepare savepoint statement", db2Message);
+    db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error managing savepoint: SQLPrepare failed to prepare savepoint statement", db2Message);
   }
 
-  /* rollback savepoint */
+  /* execute savepoint command */
   rc = SQLExecute(hstmtp->hsql);
   rc = db2CheckErr(rc, hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
   if (rc  != SQL_SUCCESS) {
-    db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error setting savepoint: SQLExecute failed to set savepoint", db2Message);
+    db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error managing savepoint: SQLExecute failed to execute savepoint command", db2Message);
   }
   db2FreeStmtHdl(hstmtp, connp);
+
+  /* If we rolled back, also release the savepoint */
+  if (!is_commit) {
+    db2Debug2("  release savepoint s%d after rollback", nest_level);
+    snprintf((char*)query, 79, "RELEASE SAVEPOINT s%d", nest_level);
+
+    /* create statement handle */
+    hstmtp = db2AllocStmtHdl(SQL_HANDLE_STMT, connp, FDW_UNABLE_TO_CREATE_EXECUTION, "error releasing savepoint: SQLAllocHandle failed to obtain hstmt");
+
+    /* prepare the query */
+    rc = SQLPrepare(hstmtp->hsql, (SQLCHAR*)query, SQL_NTS);
+    rc = db2CheckErr(rc,hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
+    if (rc != SQL_SUCCESS) {
+      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error releasing savepoint: SQLPrepare failed to prepare release statement", db2Message);
+    }
+
+    /* execute release command */
+    rc = SQLExecute(hstmtp->hsql);
+    rc = db2CheckErr(rc, hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
+    if (rc  != SQL_SUCCESS) {
+      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error releasing savepoint: SQLExecute failed to release savepoint", db2Message);
+    }
+    db2FreeStmtHdl(hstmtp, connp);
+  }
+
   db2Debug1("< db2EndSubtransaction");
 }
