@@ -622,11 +622,13 @@ SET plan_cache_mode = force_custom_plan;
 plan_cache_mode = force_custom_plan
 ```
 
-**Option 2:** Force custom plans per procedure by marking it VOLATILE
+**Option 2:** Convert to a function and mark it VOLATILE (only if transaction control isn't needed)
 ```sql
-CREATE OR REPLACE PROCEDURE myschema.my_procedure(IN p_id varchar)
+-- Note: VOLATILE only works on FUNCTIONS, not PROCEDURES
+CREATE OR REPLACE FUNCTION myschema.my_function(p_id varchar)
+RETURNS void  -- or appropriate return type
 LANGUAGE plpgsql
-VOLATILE  -- Disables plan caching for this procedure
+VOLATILE  -- Disables plan caching
 AS $$
 DECLARE
     v_result VARCHAR;
@@ -634,14 +636,17 @@ BEGIN
     SELECT column_name INTO v_result
     FROM foreign_table
     WHERE id = p_id;
-    -- ... rest of procedure
+    -- ... rest of function
 END;
 $$;
+
+-- Call with SELECT instead of CALL
+SELECT myschema.my_function('value');
 ```
 
-**Option 3:** Use functions instead of procedures (functions have different caching behavior)
+**Important:** Procedures cannot be marked VOLATILE - only functions can. If you need transaction control (COMMIT/ROLLBACK) or must use a PROCEDURE, use Option 1 instead.
 
-**Option 4:** Drop and recreate the procedure after every 5 calls (not recommended for production)
+**Option 3:** Drop and recreate the procedure after every 5 calls (not recommended for production)
 
 **Note:** This is a known limitation of how PostgreSQL's plan caching interacts with foreign data wrappers and affects all FDW implementations to varying degrees.
 
