@@ -32,6 +32,8 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
   int           found  = 0;
   SQLRETURN     rc     = 0;
   HdlEntry*     hstmtp = NULL;
+  HdlEntry*     hdlp   = NULL;
+  HdlEntry*     next_hdlp = NULL;
 
   db2Debug1("> db2EndSubtransaction");
   /* do nothing if the transaction level is lower than nest_level */
@@ -63,6 +65,20 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
     db2Error (FDW_ERROR, "db2RollbackSavepoint internal error: handle not found in cache");
   }
 
+  /*
+   * Close all existing statement handles before rolling back.
+   * When DB2 rolls back to a savepoint, it clears parameter bindings on prepared statements,
+   * even though the statement handles remain valid (ON ROLLBACK RETAIN CURSORS).
+   * We must close these handles to force re-preparation on next execution.
+   */
+  db2Debug2("  closing existing statement handles before rollback");
+  hdlp = connp->handlelist;
+  while (hdlp != NULL) {
+    next_hdlp = hdlp->next;
+    db2FreeStmtHdl(hdlp, connp);
+    hdlp = next_hdlp;
+  }
+
   db2Debug2("  rollback to savepoint s%d", nest_level);
   snprintf  ((char*)query, 49, "ROLLBACK TO SAVEPOINT s%d", nest_level);
 
@@ -71,7 +87,7 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
 
   /* prepare the query */
   rc = SQLPrepare(hstmtp->hsql, (SQLCHAR*)query, SQL_NTS);
-  rc = db2CheckErr(rc,hstmtp->hsql, hstmtp->type, __LINE__, __FILE__); 
+  rc = db2CheckErr(rc,hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
   if (rc != SQL_SUCCESS) {
     db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error rollback savepoint: SQLPrepare failed to prepare savepoint statement", db2Message);
   }
