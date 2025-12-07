@@ -42,14 +42,6 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
 
   con->xact_level = nest_level - 1;
 
-  if (is_commit) {
-    /*
-     * There is nothing to do as savepoints don't get released in DB2:
-     * Setting the same savepoint again just overwrites the previous one.
-     */
-    return;
-  }
-
   /* find the cached handles for the argument */
   for (envp = rootenvEntry; envp != NULL; envp = envp->right) {
     for (connp = envp->connlist; connp != NULL; connp = connp->right) {
@@ -66,12 +58,18 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
   }
 
   /*
-   * Close all existing statement handles before rolling back.
-   * When DB2 rolls back to a savepoint, it clears parameter bindings on prepared statements,
-   * even though the statement handles remain valid (ON ROLLBACK RETAIN CURSORS).
-   * We must close these handles to force re-preparation on next execution.
+   * Close all existing statement handles.
+   * After a subtransaction ends (commit or rollback), we need to ensure statement
+   * handles are closed to force re-preparation on next execution. This prevents
+   * issues with stale parameter bindings or statement state.
+   *
+   * On ROLLBACK: DB2 clears parameter bindings even though statement handles
+   * remain valid (ON ROLLBACK RETAIN CURSORS).
+   *
+   * On COMMIT: We also close handles to ensure clean state between procedure calls
+   * and prevent accumulation of stale handles that can cause parameter binding errors.
    */
-  db2Debug2("  closing existing statement handles before rollback");
+  db2Debug2("  closing existing statement handles");
   hdlp = connp->handlelist;
   while (hdlp != NULL) {
     next_hdlp = hdlp->next;
@@ -79,25 +77,35 @@ void db2EndSubtransaction (void* arg, int nest_level, int is_commit) {
     hdlp = next_hdlp;
   }
 
-  db2Debug2("  rollback to savepoint s%d", nest_level);
-  snprintf  ((char*)query, 49, "ROLLBACK TO SAVEPOINT s%d", nest_level);
+  if (!is_commit) {
+    /* On rollback, we need to execute ROLLBACK TO SAVEPOINT */
+    db2Debug2("  rollback to savepoint s%d", nest_level);
+    snprintf  ((char*)query, 49, "ROLLBACK TO SAVEPOINT s%d", nest_level);
 
-  /* create statement handle */
-  hstmtp = db2AllocStmtHdl(SQL_HANDLE_STMT, connp, FDW_UNABLE_TO_CREATE_EXECUTION, "error rollback savepoint: SQLAllocHandle failed to obtain hstmt");
+    /* create statement handle */
+    hstmtp = db2AllocStmtHdl(SQL_HANDLE_STMT, connp, FDW_UNABLE_TO_CREATE_EXECUTION, "error rollback savepoint: SQLAllocHandle failed to obtain hstmt");
 
-  /* prepare the query */
-  rc = SQLPrepare(hstmtp->hsql, (SQLCHAR*)query, SQL_NTS);
-  rc = db2CheckErr(rc,hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
-  if (rc != SQL_SUCCESS) {
-    db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error rollback savepoint: SQLPrepare failed to prepare savepoint statement", db2Message);
+    /* prepare the query */
+    rc = SQLPrepare(hstmtp->hsql, (SQLCHAR*)query, SQL_NTS);
+    rc = db2CheckErr(rc,hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
+    if (rc != SQL_SUCCESS) {
+      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error rollback savepoint: SQLPrepare failed to prepare savepoint statement", db2Message);
+    }
+
+    /* rollback savepoint */
+    rc = SQLExecute(hstmtp->hsql);
+    rc = db2CheckErr(rc, hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
+    if (rc  != SQL_SUCCESS) {
+      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error setting savepoint: SQLExecute failed to set savepoint", db2Message);
+    }
+    db2FreeStmtHdl(hstmtp, connp);
+  } else {
+    /*
+     * On commit, savepoints don't get released in DB2:
+     * Setting the same savepoint again just overwrites the previous one.
+     * We've already closed the handles above, which is sufficient.
+     */
+    db2Debug2("  subtransaction committed, handles closed");
   }
-
-  /* rollback savepoint */
-  rc = SQLExecute(hstmtp->hsql);
-  rc = db2CheckErr(rc, hstmtp->hsql, hstmtp->type, __LINE__, __FILE__);
-  if (rc  != SQL_SUCCESS) {
-    db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error setting savepoint: SQLExecute failed to set savepoint", db2Message);
-  }
-  db2FreeStmtHdl(hstmtp, connp);
   db2Debug1("< db2EndSubtransaction");
 }
