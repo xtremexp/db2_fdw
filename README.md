@@ -588,9 +588,62 @@ If this is set to OFF the default is cursor stability.
 
 8 Problems
 ==========
+
+8.1 Windows locale and code page issues
+----------------------------------------
 There is a problem running the fdw in Windows. Up to now this fdw can only run if the system local in Windows is set to English(United States). There  are problems with the representation of double,real and float with the '," sign.
 If the DB2 database is running Code Page 1252 then also the postgres db should be WIN1252.
+
+8.2 XML data type limitation
+-----------------------------
 Up to now it is not possible to get the XML data type with the OCI db2 functions. Perhaps the odbc driver is more compatible for this feature.
+
+8.3 PostgreSQL procedures and plan caching
+-------------------------------------------
+When using db2_fdw foreign tables inside PostgreSQL procedures (or DO blocks) with parameter-based WHERE clauses, you may encounter an error after exactly 5 successful executions:
+
+```
+ERROR: error executing query: SQLExecute failed to execute remote query
+SQLSTATE = 07001
+[IBM][CLI Driver] CLI0100E Wrong number of parameters. SQLSTATE=07001
+```
+
+**Root Cause:**
+PostgreSQL caches execution plans for procedures and prepared statements. After 5 executions, PostgreSQL switches from "custom plans" (generated per execution) to a "generic plan" (reused across executions). Generic plans don't always pass query parameters correctly to foreign data wrappers, resulting in the parameter count error.
+
+**Workarounds:**
+
+**Option 1:** Force custom plans globally (recommended for development/testing)
+```sql
+-- Set for current session
+SET plan_cache_mode = force_custom_plan;
+
+-- Or set globally in postgresql.conf
+plan_cache_mode = force_custom_plan
+```
+
+**Option 2:** Force custom plans per procedure by marking it VOLATILE
+```sql
+CREATE OR REPLACE PROCEDURE myschema.my_procedure(IN p_id varchar)
+LANGUAGE plpgsql
+VOLATILE  -- Disables plan caching for this procedure
+AS $$
+DECLARE
+    v_result VARCHAR;
+BEGIN
+    SELECT column_name INTO v_result
+    FROM foreign_table
+    WHERE id = p_id;
+    -- ... rest of procedure
+END;
+$$;
+```
+
+**Option 3:** Use functions instead of procedures (functions have different caching behavior)
+
+**Option 4:** Drop and recreate the procedure after every 5 calls (not recommended for production)
+
+**Note:** This is a known limitation of how PostgreSQL's plan caching interacts with foreign data wrappers and affects all FDW implementations to varying degrees.
 
 
 9 Support
