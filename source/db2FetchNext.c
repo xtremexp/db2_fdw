@@ -22,23 +22,10 @@ int db2FetchNext (DB2Session* session, DB2ResultColumn* resultList);
 int db2FetchNext (DB2Session* session, DB2ResultColumn* resultList) {
   SQLRETURN rc = 0;
   DB2ResultColumn* res = NULL;
-  DB2ResultColumn* scan = NULL;
-  int max_resnum = 0;
-  int i = 0;
   db2Entry1();
   /* make sure there is a statement handle stored in "session" */
   if (session->stmtp == NULL) {
     db2Error (FDW_ERROR, "db2FetchNext internal error: statement handle is NULL");
-  }
-
-  /* Reset both the portable value and the driver-owned SQLLEN storage. */
-  for (res = resultList; res; res = res->next) {
-    res->val_null = 0;
-    res->val_len = 0;
-    memset(&res->val_indicator, 0, sizeof(res->val_indicator));
-    if (res->val != NULL && res->val_size > 0) {
-      res->val[0] = '\0';
-    }
   }
 
   /* fetch the next result row */
@@ -48,54 +35,52 @@ int db2FetchNext (DB2Session* session, DB2ResultColumn* resultList) {
     db2Error_d (err_code == 8177 ? FDW_SERIALIZATION_FAILURE : FDW_UNABLE_TO_CREATE_EXECUTION, "error fetching result: SQLFetch failed to fetch next result row", db2Message);
   }
 
-  /* Copy bound SQLLEN indicators out of the ABI-neutral storage. */
   if (rc == SQL_SUCCESS) {
+    /*
+     * Single pass over the bound result columns: copy the driver-owned SQLLEN
+     * indicator of the fetched row into the portable per-row state, normalize
+     * it and terminate bound text buffers.  (The previous code traversed the
+     * result list four times per row.)
+     */
     for (res = resultList; res; res = res->next) {
       SQLLEN indicator = 0;
-      int uses_getdata = res->unbound;
 
-      if (uses_getdata)
+      if (res->unbound)
         continue;
       if (sizeof(indicator) > sizeof(res->val_indicator.bytes))
         db2Error(FDW_ERROR, "db2FetchNext internal error: SQLLEN does not fit into result indicator storage");
       memcpy(&indicator, res->val_indicator.bytes, sizeof(indicator));
       res->val_null = (intptr_t) indicator;
-    }
-  }
 
-  /* Fetch only the deliberately unbound result columns via SQLGetData. */
-  if (rc == SQL_SUCCESS && resultList) {
+      if (res->val_null == (intptr_t) SQL_NULL_DATA) {
+        res->val_len = 0;
+      } else if (res->val_null >= 0 && res->val != NULL && res->val_size > 0) {
+        /*
+         * SQLBindCol reports the payload length through its indicator.  Preserve
+         * that bounded length instead of forcing convertTuple() to search for a
+         * terminator with strlen().
+         */
+        res->val_len = (size_t) res->val_null;
+        if (res->val_len >= res->val_size)
+          res->val_len = res->val_size - 1;
+        res->val[res->val_len] = '\0';
+      }
+    }
+
     /*
-     * Some DB2 CLI / ODBC driver setups require SQLGetData calls to be made in
-     * strict ascending column order. Our internal result column list is not
-     * guaranteed to be ordered by resnum, so enforce ordering here.
+     * Fetch the deliberately unbound columns via SQLGetData.  This is a rare
+     * fallback path (see db2PrepareQuery).  Some DB2 CLI/ODBC drivers require
+     * SQLGetData calls in strict ascending column order, so db2PrepareQuery
+     * stored these columns sorted by resnum in session->getdata_cols; the old
+     * code re-scanned the whole result list for every column number on every
+     * row, which was O(n^2).
      */
-    for (scan = resultList; scan; scan = scan->next) {
-      if (scan->resnum > max_resnum)
-        max_resnum = scan->resnum;
-    }
-
-    for (i = 1; i <= max_resnum; i++) {
+    for (int i = 0; i < session->n_getdata_cols; ++i) {
       SQLLEN ind = 0;
       SQLRETURN get_rc_raw;
       SQLRETURN get_rc;
-      int want_getdata = 0;
 
-      res = NULL;
-      for (scan = resultList; scan; scan = scan->next) {
-        if (scan->resnum == i) {
-          res = scan;
-          break;
-        }
-      }
-      if (res == NULL) {
-        continue;
-      }
-
-      want_getdata = res->unbound;
-
-      if (!want_getdata)
-        continue;
+      res = session->getdata_cols[i];
 
       if (res->val == NULL || res->val_size == 0) {
         db2Error (FDW_ERROR, "db2FetchNext internal error: result column buffer is NULL");
@@ -162,26 +147,6 @@ int db2FetchNext (DB2Session* session, DB2ResultColumn* resultList) {
         res->val_len = res->val_size - 1;
       }
       res->val[res->val_len] = '\0';
-    }
-  }
-
-  /* Normalize the already copied indicator and terminate bound text buffers. */
-  if (rc == SQL_SUCCESS && resultList) {
-    for (res = resultList; res; res = res->next) {
-      if (res->val_null == (intptr_t) SQL_NULL_DATA) {
-        res->val_null = (intptr_t) SQL_NULL_DATA;
-        res->val_len = 0;
-      } else if (res->val_null >= 0 && res->val != NULL && res->val_size > 0) {
-        /*
-         * SQLBindCol reports the payload length through its indicator.  Preserve
-         * that bounded length instead of forcing convertTuple() to search for a
-         * terminator with strlen().
-         */
-        res->val_len = (size_t) res->val_null;
-        if (res->val_len >= res->val_size)
-          res->val_len = res->val_size - 1;
-        res->val[res->val_len] = '\0';
-      }
     }
   }
 

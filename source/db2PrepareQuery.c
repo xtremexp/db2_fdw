@@ -189,9 +189,42 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
   /*
    * Unbound columns are read with SQLGetData, which works on the single row
    * the cursor is currently positioned on, so they force single-row fetching.
+   * Index them sorted by resnum once per prepare: some DB2 CLI/ODBC drivers
+   * require SQLGetData calls in strict ascending column order, and this
+   * spares db2FetchNext from re-scanning the result list for every column
+   * number on every row (which was O(n^2)).
    */
-  if (need_getdata)
+  if (need_getdata) {
+    DB2ResultColumn** cols = NULL;
+    int               n    = 0;
+    int               i    = 0;
+    int               j    = 0;
+
     fetchsize = 1;
+
+    for (res = resultList; res; res = res->next) {
+      if (res->unbound)
+        ++n;
+    }
+    cols = (DB2ResultColumn**) db2alloc(sizeof(DB2ResultColumn*) * n, "session->getdata_cols");
+    i = 0;
+    for (res = resultList; res; res = res->next) {
+      if (res->unbound)
+        cols[i++] = res;
+    }
+    /* insertion sort by resnum (ascending) */
+    for (i = 1; i < n; ++i) {
+      DB2ResultColumn* tmp = cols[i];
+      for (j = i - 1; j >= 0 && cols[j]->resnum > tmp->resnum; --j)
+        cols[j + 1] = cols[j];
+      cols[j + 1] = tmp;
+    }
+    session->getdata_cols   = cols;
+    session->n_getdata_cols = n;
+  } else {
+    session->getdata_cols   = NULL;
+    session->n_getdata_cols = 0;
+  }
 
   db2Debug2("is_select: %s",is_select ? "true" : "false");
   db2Debug2("col_pos: %d",col_pos);

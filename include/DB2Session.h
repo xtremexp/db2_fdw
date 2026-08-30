@@ -24,5 +24,14 @@ struct db2Session {
   DB2EnvEntry*        envp;
   DB2ConnEntry*       connp;
   HdlEntry*           stmtp;
+  /*
+   * Index of the deliberately unbound (SQLGetData) result columns of the
+   * current statement, sorted by resnum (some drivers require SQLGetData
+   * calls in ascending column order).  Built once per prepare by
+   * db2PrepareQuery so that db2FetchNext does not have to re-scan the result
+   * list for every column on every row.  NULL if all columns are bound.
+   */
+  struct db2ResultColumn** getdata_cols;
+  int                      n_getdata_cols;
 };
 #endif
