@@ -52,7 +52,7 @@ int db2FetchNext (DB2Session* session, DB2ResultColumn* resultList) {
   if (rc == SQL_SUCCESS) {
     for (res = resultList; res; res = res->next) {
       SQLLEN indicator = 0;
-      int uses_getdata = (res->colType == SQL_DECIMAL || res->colType == SQL_NUMERIC || res->colType == SQL_DECFLOAT);
+      int uses_getdata = res->unbound;
 
       if (uses_getdata)
         continue;
@@ -63,7 +63,7 @@ int db2FetchNext (DB2Session* session, DB2ResultColumn* resultList) {
     }
   }
 
-  /* Fetch only the deliberately unbound numeric result columns via SQLGetData. */
+  /* Fetch only the deliberately unbound result columns via SQLGetData. */
   if (rc == SQL_SUCCESS && resultList) {
     /*
      * Some DB2 CLI / ODBC driver setups require SQLGetData calls to be made in
@@ -92,7 +92,7 @@ int db2FetchNext (DB2Session* session, DB2ResultColumn* resultList) {
         continue;
       }
 
-      want_getdata = (res->colType == SQL_DECIMAL || res->colType == SQL_NUMERIC || res->colType == SQL_DECFLOAT);
+      want_getdata = res->unbound;
 
       if (!want_getdata)
         continue;

@@ -46,21 +46,6 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
   fetchsize = 1;
   #endif
 
-  /*
-   * DECIMAL/NUMERIC/DECFLOAT are retrieved separately with SQLGetData.  All
-   * other columns stay bound.  In particular, do not switch the whole result
-   * set to SQL_RD_OFF: that changes the lifetime and conversion semantics of
-   * every column and was the source of a broad SELECT workaround, not a fix.
-   */
-  for (res = resultList; res; res = res->next) {
-    if (res->colType == SQL_DECIMAL || res->colType == SQL_NUMERIC || res->colType == SQL_DECFLOAT) {
-      need_getdata = 1;
-      break;
-    }
-  }
-  if (need_getdata)
-    fetchsize = 1;
-
   db2Entry1();
   db2Debug2("query    : '%s'",query);
   db2Debug2("prefetch : %d",prefetch);
@@ -73,10 +58,8 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
   /* create statement handle */
   session->stmtp = db2AllocStmtHdl(SQL_HANDLE_STMT, session->connp, FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: failed to allocate statement handle");
   db2Debug2("session->stmtp->hsql: %d",session->stmtp->hsql);
-  /* set prefetch options */
+  /* set cursor type options */
   if (is_select) {
-    SQLULEN prefetch_rows = prefetch;
-    SQLULEN cur_fetchsize = fetchsize;
     db2Debug3("IS_SELECT");
     if (for_update) {
       db2Debug3("FOR UPDATE");
@@ -106,24 +89,6 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
       }
       db2Debug3("set cursor forward-only");
     }
-
-    /* The current implementation owns one value/indicator buffer per column. */
-    rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_ROW_ARRAY_SIZE, SQL_VALUE_PTR_ULEN(cur_fetchsize), 0);
-    rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
-    if (rc != SQL_SUCCESS) {
-      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set fetchsize in statement handle", db2Message);
-    }
-    db2Debug2("set cursor fetchsize: %d",cur_fetchsize);
-
-    /* PREFETCH_NROWS only applies to the scrollable FOR UPDATE cursor. */
-    if (for_update) {
-      rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_PREFETCH_NROWS, SQL_VALUE_PTR_ULEN(prefetch_rows), 0);
-      rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
-      if (rc != SQL_SUCCESS) {
-        db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set number of prefetched rows in statement handle", db2Message);
-      }
-      db2Debug2("set cursor prefetch: %d",prefetch_rows);
-    }
   }
 
   /* prepare the statement */
@@ -137,7 +102,6 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
   /* loop through expected result columns */
   for (res = resultList; res; res = res->next){
     SQLSMALLINT fparamType = c2param((SQLSMALLINT)res->colType);
-    int use_getdata = 0;
     size_t needed = 0;
     /* Unfortunately DB2 handles DML statements with a RETURNING clause quite different from SELECT statements.
      * In the latter, the result columns are "defined", i.e. bound to some storage space.
@@ -150,33 +114,26 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
     }
 
     /*
-     * For DECIMAL/NUMERIC/DECFLOAT results, avoid binding with SQLBindCol.
-     * Some DB2 CLI setups throw CLI0111E / SQLSTATE 22003 during SQLFetch when
-     * converting bound numeric columns.
-     *
-     * We instead fetch these columns via SQLGetData after SQLFetch.
-     */
-    use_getdata = (res->colType == SQL_DECIMAL || res->colType == SQL_NUMERIC || res->colType == SQL_DECFLOAT);
-
-    /*
-     * Numeric result columns are typically bound as SQL_C_CHAR.
-     *
-     * Some DB2 CLI setups report CLI0111E / SQLSTATE 22003 during SQLFetch when
-     * converting DECIMAL/NUMERIC into too-small output buffers.
-     *
-     * Ensure the buffer is large enough for the textual representation:
+     * Numeric result columns (DECIMAL/NUMERIC/DECFLOAT) are bound like every
+     * other column, as SQL_C_CHAR.  They used to be left unbound and fetched
+     * with SQLGetData per row, which is by far the slowest retrieval method
+     * and also forced single-row fetching.  The CLI0111E / SQLSTATE 22003
+     * errors that motivated this were caused by conversion into too-small
+     * output buffers, so size the buffer for the maximal textual
+     * representation instead:
      *  - precision digits
      *  - optional sign
      *  - optional decimal point
      *  - NUL terminator
+     *  - headroom for driver-specific formatting differences
      * For DECFLOAT, use a conservative minimum to accommodate exponent forms.
      */
     if (res->colType == SQL_DECIMAL || res->colType == SQL_NUMERIC || res->colType == SQL_DECFLOAT) {
       size_t prec = (res->colSize > 0 ? res->colSize : 32);
       size_t scale = (res->colScale > 0 ? res->colScale : 0);
-      needed = prec + 2 /* sign + NUL */ + (scale > 0 ? 1 /* '.' */ : 0);
-      if (res->colType == SQL_DECFLOAT && needed < 64)
-        needed = 64;
+      needed = prec + 2 /* sign + NUL */ + (scale > 0 ? 1 /* '.' */ : 0) + 8 /* headroom */;
+      if (res->colType == SQL_DECFLOAT && needed < 72)
+        needed = 72;
 
       if (res->val_size < needed) {
         res->val = (char*) db2realloc(needed, res->val, "res->val");
@@ -200,8 +157,9 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
     db2Debug2("res->resnum        : %d" ,res->resnum);
     db2Debug2("fparamType: %d (%s)",fparamType,param2name(fparamType));
 
-    if (use_getdata) {
-      /* DECIMAL/NUMERIC/DECFLOAT are always fetched via SQLGetData. */
+    if (res->unbound) {
+      /* the column is deliberately unbound and will be fetched via SQLGetData
+       * in db2FetchNext (set by a previous prepare or by a failed bind below) */
       res->val_null = (intptr_t) SQL_NULL_DATA;
       res->val_len = 0;
     } else {
@@ -212,12 +170,28 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
       db2Debug2("SQLBindCol(%d,%d,%d(%s),%x,%ld,%x)",session->stmtp->hsql,res->resnum, fparamType, param2name(fparamType), res->val, res->val_size, res->val_indicator.bytes);
       rc = SQLBindCol (session->stmtp->hsql,res->resnum, fparamType, res->val, res->val_size, (SQLLEN*) res->val_indicator.bytes);
       rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
-      if (rc != SQL_SUCCESS) {
-        db2Error_d(FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLBindCol failed to define result value", db2Message);
+      if (rc == SQL_ERROR) {
+        /*
+         * Some DB2 CLI setups refuse to bind certain column types.  Leave the
+         * column unbound and fetch it via SQLGetData in db2FetchNext instead
+         * of failing the whole query.
+         */
+        db2Debug2("SQLBindCol failed for result column %d (%s), fetching it via SQLGetData instead", res->resnum, res->colName ? res->colName : "?");
+        res->unbound = 1;
+        need_getdata = 1;
+        res->val_null = (intptr_t) SQL_NULL_DATA;
+        res->val_len = 0;
       }
     }
     col_pos++;
   }
+
+  /*
+   * Unbound columns are read with SQLGetData, which works on the single row
+   * the cursor is currently positioned on, so they force single-row fetching.
+   */
+  if (need_getdata)
+    fetchsize = 1;
 
   db2Debug2("is_select: %s",is_select ? "true" : "false");
   db2Debug2("col_pos: %d",col_pos);
@@ -230,6 +204,31 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
     rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
     if (rc != SQL_SUCCESS) {
       db2Error_d ( FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLBindCol failed to define result value", db2Message);
+    }
+  }
+
+  /* set the fetch options (after binding, since the SQLGetData fallback
+   * forces a rowset size of 1) */
+  if (is_select) {
+    SQLULEN prefetch_rows = prefetch;
+    SQLULEN cur_fetchsize = fetchsize;
+
+    /* The current implementation owns one value/indicator buffer per column. */
+    rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_ROW_ARRAY_SIZE, SQL_VALUE_PTR_ULEN(cur_fetchsize), 0);
+    rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
+    if (rc != SQL_SUCCESS) {
+      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set fetchsize in statement handle", db2Message);
+    }
+    db2Debug2("set cursor fetchsize: %d",cur_fetchsize);
+
+    /* PREFETCH_NROWS only applies to the scrollable FOR UPDATE cursor. */
+    if (for_update) {
+      rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_PREFETCH_NROWS, SQL_VALUE_PTR_ULEN(prefetch_rows), 0);
+      rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
+      if (rc != SQL_SUCCESS) {
+        db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set number of prefetched rows in statement handle", db2Message);
+      }
+      db2Debug2("set cursor prefetch: %d",prefetch_rows);
     }
   }
   db2Exit1();

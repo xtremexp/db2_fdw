@@ -58,6 +58,7 @@ typedef struct db2ResultColumn {
   Oid                     typinput;      // cached OID of the PG type input function (InvalidOid until first use)
   int                     pkey;          // nonzero for primary keys, later set to the resjunk attribute number
   int                     resnum;        // position of result in cursor 1 based
+  int                     unbound;       // 1 if the column is deliberately unbound and fetched via SQLGetData
   char*                   val;           // buffer for DB2 to return results in (LOB locator for LOBs)
   size_t                  val_size;      // allocated size in val
   size_t                  val_len;       // actual length of val
