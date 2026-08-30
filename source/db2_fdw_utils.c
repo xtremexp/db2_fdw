@@ -197,7 +197,7 @@ void convertTuple (DB2Session* session, DB2ResultColumn* reslist, DB2TupleIndexM
     db2Debug5("res->pgattnum : %d"  ,res->pgattnum);
     db2Debug5("res->pgtype   : %d"  ,res->pgtype  );
     db2Debug5("res->pgtypmod : %d"  ,res->pgtypmod);
-    db2Debug5("res->val      : %s"  ,res->val ? res->val : "(null)");
+    db2Debug5("res->cur_val  : %s"  ,res->cur_val ? res->cur_val : "(null)");
     db2Debug5("res->val_len  : %ld"  ,(long) res->val_len );
     db2Debug5("res->val_null : %ld"  ,(long) res->val_null);
 
@@ -218,9 +218,9 @@ void convertTuple (DB2Session* session, DB2ResultColumn* reslist, DB2TupleIndexM
         case DB2_LONGVARBINARY: {
           db2Debug5("DB2_LONGBINARY datatypes");
           /* for LONG and LONG RAW, the first 4 bytes contain the length */
-          value_len = *((int32*) res->val);
+          value_len = *((int32*) res->cur_val);
           /* the rest is the actual data */
-          value = res->val;
+          value = res->cur_val;
           /* terminating zero byte (needed for LONGs) */
           value[value_len] = '\0';
         }
@@ -233,9 +233,9 @@ void convertTuple (DB2Session* session, DB2ResultColumn* reslist, DB2TupleIndexM
         case DB2_DECFLOAT:
         case DB2_DOUBLE: {
           char* tmp_value = NULL;
-  
+
           db2Debug5("DB2_FLOAT, DECIMAL, SMALLINT, INTEGER, REAL, DECFLOAT, DOUBLE");
-          value     = res->val;
+          value     = res->cur_val;
           value_len = res->val_len;
           if (value == NULL || res->val_size == 0) {
             ereport(ERROR,
@@ -256,7 +256,7 @@ void convertTuple (DB2Session* session, DB2ResultColumn* reslist, DB2TupleIndexM
         default: {
           db2Debug5("should be string based values");
           /* for other data types, db2Table contains the results */
-          value     = res->val;
+          value     = res->cur_val;
           value_len = res->val_len;
           if (value == NULL || res->val_size == 0) {
             ereport(ERROR,

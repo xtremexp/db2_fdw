@@ -1,25 +1,7 @@
 #ifndef DB2RESULTCOLUMN_H
 #define DB2RESULTCOLUMN_H
 
-/*
- * ODBC/CLI uses SQLLEN* as the indicator pointer for SQLBindCol.
- *
- * This header is also included by PostgreSQL-facing translation units where
- * the DB2 CLI headers cannot be included.  In addition, SQLLEN is 32 bit for
- * the native Db2 CLI build and 64 bit for some ODBC builds.  Binding the
- * driver directly to an intptr_t therefore gives it an object of the wrong
- * effective type on at least one of these builds.
- *
- * Keep an aligned, opaque eight-byte area for the driver-owned SQLLEN value.
- * DB2 CLI translation units copy the value to val_null after each fetch.  That
- * keeps the SQLBindCol ABI separate from the portable result metadata.
- */
 #include <stdint.h>
-
-typedef union db2ResultIndicatorStorage {
-  int64_t       alignment;
-  unsigned char bytes[8];
-} DB2ResultIndicatorStorage;
 
 /*
  * Defines how a DB2 cursor result column maps to a PostgreSQL tuple slot.
@@ -36,7 +18,7 @@ typedef enum db2TupleIndexMode {
 } DB2TupleIndexMode;
 /** DB2ResultColumn
  *  A full descriptor of a DB2 table column and its corresponding PG column.
- * 
+ *
  *  @author Thomas Muenz
  *  @since  18.2.0
  */
@@ -59,11 +41,14 @@ typedef struct db2ResultColumn {
   int                     pkey;          // nonzero for primary keys, later set to the resjunk attribute number
   int                     resnum;        // position of result in cursor 1 based
   int                     unbound;       // 1 if the column is deliberately unbound and fetched via SQLGetData
-  char*                   val;           // buffer for DB2 to return results in (LOB locator for LOBs)
-  size_t                  val_size;      // allocated size in val
-  size_t                  val_len;       // actual length of val
+  char*                   val;           // buffer for DB2 to return results in; with rowset fetching it holds rowset_size rows of val_size+1 bytes each
+  size_t                  val_alloc_bytes; // bytes currently allocated for val (rowset buffers are reused across re-prepares)
+  size_t                  val_size;      // per-row data size passed to the driver (the rowset stride is val_size+1)
+  size_t                  val_len;       // actual length of the current row's value
   intptr_t                val_null;      // normalized NULL/length indicator used by PostgreSQL-facing code
-  DB2ResultIndicatorStorage val_indicator; // aligned SQLLEN storage owned by DB2 CLI while a column is bound
+  char*                   cur_val;       // pointer to the current row's data within val (== val for single-row fetching)
+  void*                   val_ind;       // rowset indicator array (SQLLEN[val_ind_rows]) owned by DB2 CLI while the column is bound
+  int                     val_ind_rows;  // number of SQLLEN slots allocated in val_ind
   db2NoEncErrType         noencerr;      // no encoding error produced
   struct db2ResultColumn* next;
 } DB2ResultColumn;

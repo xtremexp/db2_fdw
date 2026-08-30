@@ -179,9 +179,10 @@ DB2FdwState* deserializePlanData (List* list) {
     res->resnum         = (int) DatumGetInt32(((Const*)list_nth(list, idx++))->constvalue);
     db2Debug3("deserialize res[%d].resnum: %d"  ,i, res->resnum);
     res->val            = (char*) db2alloc (MIN(res->val_size + 1, 1073741823), "res->val");
+    res->val_alloc_bytes = MIN(res->val_size + 1, 1073741823);
+    res->cur_val        = res->val;
     res->val_len        = 0;
     res->val_null       = 1;
-    memset(&res->val_indicator, 0, sizeof(res->val_indicator));
     res->next           = state->resultList;
     state->resultList   = res;
   }

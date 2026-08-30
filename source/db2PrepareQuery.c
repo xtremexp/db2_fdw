@@ -36,15 +36,38 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
   SQLRETURN         rc          = 0;
   DB2ResultColumn*  res         = NULL;
   int               need_getdata = 0;
+  SQLULEN           rowset_alloc = 1;
 
   /* figure out if the query is a SELECT / SELECT FOR UPDATE */
   is_select  = (strncmp (query, "SELECT", 6) == 0);
   for_update = (strstr (query, "FOR UPDATE") != NULL);
 
-  #ifdef FIXED_FETCH_SIZE
-  // Until the proper handling of multiple rows results on a single query are added the fetch size must be 1
-  fetchsize = 1;
-  #endif
+  /*
+   * Rowset (block fetch) size used for buffer allocation and binding: the
+   * user-configured fetch size, clamped, and reduced to 1 for everything the
+   * block-fetch path cannot handle:
+   * - DML statements have no result set to fetch rowsets of
+   * - SELECT FOR UPDATE uses the dynamic cursor with SQL_ATTR_PREFETCH_NROWS
+   * - BLOB/CLOB columns are read with SQLGetData on the current row
+   * - statements without result columns use the single-row dummy buffer
+   * A bind failure (need_getdata) reduces the final rowset size to 1 after
+   * the bind loop below.
+   */
+  if (fetchsize < 1)
+    fetchsize = 1;
+  rowset_alloc = (SQLULEN) fetchsize;
+  if (rowset_alloc > DB2_MAX_ATTR_ROW_ARRAY_SIZE)
+    rowset_alloc = DB2_MAX_ATTR_ROW_ARRAY_SIZE;
+  if (!is_select || for_update)
+    rowset_alloc = 1;
+  if (resultList == NULL)
+    rowset_alloc = 1;
+  for (res = resultList; res; res = res->next) {
+    if (res->colType == SQL_BLOB || res->colType == SQL_CLOB) {
+      rowset_alloc = 1;
+      break;
+    }
+  }
 
   db2Entry1();
   db2Debug2("query    : '%s'",query);
@@ -138,7 +161,30 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
       if (res->val_size < needed) {
         res->val = (char*) db2realloc(needed, res->val, "res->val");
         res->val_size = needed;
+        res->val_alloc_bytes = needed;
       }
+    }
+
+    /*
+     * Allocate (or reuse across re-prepares) the rowset buffers of this
+     * column.  With rowset fetching, "val" holds rowset_alloc rows of
+     * val_size+1 bytes each (the spare byte per row keeps the terminating 0
+     * written by convertTuple within the row's own stride), and "val_ind"
+     * holds one SQLLEN indicator per row for column-wise binding.
+     */
+    if (rowset_alloc > 1) {
+      size_t needed_bytes = (res->val_size + 1) * rowset_alloc;
+      if (res->val_alloc_bytes < needed_bytes) {
+        res->val = (char*) db2realloc(needed_bytes, res->val, "res->val rowset");
+        res->val_alloc_bytes = needed_bytes;
+      }
+    }
+    if (res->val_ind_rows < (int) rowset_alloc) {
+      if (res->val_ind == NULL)
+        res->val_ind = db2alloc(sizeof(SQLLEN) * rowset_alloc, "res->val_ind");
+      else
+        res->val_ind = db2realloc(sizeof(SQLLEN) * rowset_alloc, res->val_ind, "res->val_ind");
+      res->val_ind_rows = (int) rowset_alloc;
     }
 
     db2Debug2("res->colName       : %s" ,res->colName);
@@ -163,12 +209,14 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
       res->val_null = (intptr_t) SQL_NULL_DATA;
       res->val_len = 0;
     } else {
-      if (sizeof(SQLLEN) > sizeof(res->val_indicator.bytes)) {
-        db2Error(FDW_ERROR, "db2PrepareQuery internal error: SQLLEN does not fit into result indicator storage");
+      db2Debug2("SQLBindCol(%d,%d,%d(%s),%x,%ld,%x)",session->stmtp->hsql,res->resnum, fparamType, param2name(fparamType), res->val, res->val_size, res->val_ind);
+      if (rowset_alloc > 1) {
+        /* column-wise rowset binding: one buffer of val_size+1 bytes and one
+         * SQLLEN indicator per row of the rowset */
+        rc = SQLBindCol (session->stmtp->hsql,res->resnum, fparamType, res->val, (SQLLEN)(res->val_size + 1), (SQLLEN*) res->val_ind);
+      } else {
+        rc = SQLBindCol (session->stmtp->hsql,res->resnum, fparamType, res->val, res->val_size, (SQLLEN*) res->val_ind);
       }
-      memset(&res->val_indicator, 0, sizeof(res->val_indicator));
-      db2Debug2("SQLBindCol(%d,%d,%d(%s),%x,%ld,%x)",session->stmtp->hsql,res->resnum, fparamType, param2name(fparamType), res->val, res->val_size, res->val_indicator.bytes);
-      rc = SQLBindCol (session->stmtp->hsql,res->resnum, fparamType, res->val, res->val_size, (SQLLEN*) res->val_indicator.bytes);
       rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
       if (rc == SQL_ERROR) {
         /*
@@ -199,8 +247,6 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
     int               n    = 0;
     int               i    = 0;
     int               j    = 0;
-
-    fetchsize = 1;
 
     for (res = resultList; res; res = res->next) {
       if (res->unbound)
@@ -240,29 +286,62 @@ void db2PrepareQuery (DB2Session* session, const char *query, DB2ResultColumn* r
     }
   }
 
-  /* set the fetch options (after binding, since the SQLGetData fallback
-   * forces a rowset size of 1) */
-  if (is_select) {
-    SQLULEN prefetch_rows = prefetch;
-    SQLULEN cur_fetchsize = fetchsize;
+  /*
+   * Final rowset size: the allocation size, reduced to 1 when any column had
+   * to be left unbound.  Set the rowset statement attributes and reset the
+   * rowset state of the session for the new statement.
+   */
+  {
+    SQLULEN rowset_size = rowset_alloc;
 
-    /* The current implementation owns one value/indicator buffer per column. */
-    rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_ROW_ARRAY_SIZE, SQL_VALUE_PTR_ULEN(cur_fetchsize), 0);
-    rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
-    if (rc != SQL_SUCCESS) {
-      db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set fetchsize in statement handle", db2Message);
-    }
-    db2Debug2("set cursor fetchsize: %d",cur_fetchsize);
+    if (need_getdata)
+      rowset_size = 1;
 
-    /* PREFETCH_NROWS only applies to the scrollable FOR UPDATE cursor. */
-    if (for_update) {
-      rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_PREFETCH_NROWS, SQL_VALUE_PTR_ULEN(prefetch_rows), 0);
+    if (is_select) {
+      SQLULEN prefetch_rows = prefetch;
+
+      rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_ROW_ARRAY_SIZE, SQL_VALUE_PTR_ULEN(rowset_size), 0);
       rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
       if (rc != SQL_SUCCESS) {
-        db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set number of prefetched rows in statement handle", db2Message);
+        db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set fetchsize in statement handle", db2Message);
       }
-      db2Debug2("set cursor prefetch: %d",prefetch_rows);
+      db2Debug2("set cursor fetchsize: %d",rowset_size);
+
+      /* the driver reports the number of rows actually fetched per block and
+       * their status, so partial rowsets at the end of the result set are
+       * handled correctly */
+      rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_ROWS_FETCHED_PTR, (SQLPOINTER) &session->rows_fetched, 0);
+      rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
+      if (rc != SQL_SUCCESS) {
+        db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set rows-fetched pointer in statement handle", db2Message);
+      }
+      if (session->row_status_rows < rowset_size) {
+        if (session->row_status == NULL)
+          session->row_status = (SQLUSMALLINT*) db2alloc(sizeof(SQLUSMALLINT) * rowset_size, "session->row_status");
+        else
+          session->row_status = (SQLUSMALLINT*) db2realloc(sizeof(SQLUSMALLINT) * rowset_size, session->row_status, "session->row_status");
+        session->row_status_rows = rowset_size;
+      }
+      rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_ROW_STATUS_PTR, (SQLPOINTER) session->row_status, 0);
+      rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
+      if (rc != SQL_SUCCESS) {
+        db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set row status pointer in statement handle", db2Message);
+      }
+
+      /* PREFETCH_NROWS only applies to the scrollable FOR UPDATE cursor. */
+      if (for_update) {
+        rc = SQLSetStmtAttr(session->stmtp->hsql, SQL_ATTR_PREFETCH_NROWS, SQL_VALUE_PTR_ULEN(prefetch_rows), 0);
+        rc = db2CheckErr(rc, session->stmtp->hsql, session->stmtp->type, __LINE__, __FILE__);
+        if (rc != SQL_SUCCESS) {
+          db2Error_d (FDW_UNABLE_TO_CREATE_EXECUTION, "error executing query: SQLSetStmtAttr failed to set number of prefetched rows in statement handle", db2Message);
+        }
+        db2Debug2("set cursor prefetch: %d",prefetch_rows);
+      }
     }
+
+    session->rowset_size = rowset_size;
+    session->rowset_rows = 0;
+    session->cur_row     = 0;
   }
   db2Exit1();
 }

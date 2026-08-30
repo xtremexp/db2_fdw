@@ -235,10 +235,12 @@ Foreign table options
   Higher values can speed up performance, but will use more memory on the
   PostgreSQL server.
 
-- **fetch_size** (optional, fix 1)
+- **fetch_size** (optional, default 100)
 
-  In future enhancements fetch_size will be used to enable fetching of that number of rows at once.
-  Currently any number is ignored and 1 is used as a fix value, until the logic to cope with a larger result that one is implemnted.
+  The number of result rows that are fetched from DB2 in one block per scan iteration.
+  Higher values can speed up large scans considerably (fewer round trips to DB2), at the cost of more memory on the PostgreSQL server (fetch_size times the row width per result column).
+  A value defined on a table will override the value provided on the server, just for that table.
+  Queries with BLOB/CLOB columns, SELECT FOR UPDATE, or columns that the DB2 CLI driver refuses to bind are always fetched one row at a time.
 
 - **batch_size** (optional, default 100)
 
