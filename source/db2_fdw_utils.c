@@ -436,8 +436,8 @@ bool is_shippable (Oid objectId, Oid classId, DB2FdwState* fpinfo) {
         entry = (ShippableCacheEntry*) hash_search(ShippableCacheHash, &key, HASH_ENTER, NULL);
         entry->shippable = shippable;
       } else {
-        db2Debug4("no shippable cache entry (%x) found shippable is set to false", entry);
-        shippable = false;
+        db2Debug4("shippable cache hit (%x): %d", entry, (int) entry->shippable);
+        shippable = entry->shippable;
       }
     }
   }
@@ -499,5 +499,5 @@ static bool lookup_shippable(Oid objectId, Oid classId, DB2FdwState* fpinfo) {
   /* If so, is that extension in fpinfo->shippable_extensions? */
   isValid = (OidIsValid(extensionOid) && list_member_oid(fpinfo->shippable_extensions, extensionOid));
   db2Exit5(": %s", (isValid) ? "true" : "false");
-  return false;
+  return isValid;
 }
