@@ -24,6 +24,7 @@ void db2GetLob (DB2Session* session, DB2ResultColumn* column, char** value, long
   SQLCHAR        buf[LOB_CHUNK_SIZE+1];
   SQLSMALLINT    fcType = (column->colType == SQL_CLOB) ? SQL_C_CHAR : SQL_C_BINARY;
   int            extend = 0;
+  long           capacity = 0;   /* bytes currently allocated for *value */
   db2Entry1();
   db2Debug2("column->colName: '%s'",column->colName);
   db2Debug2("column->resnum :  %d ",column->resnum);
@@ -62,16 +63,28 @@ void db2GetLob (DB2Session* session, DB2ResultColumn* column, char** value, long
       db2Debug2("extend   : %d", extend);
       if (*value_len == 0) {
         if (extend > 0) {
-          *value = db2alloc (*value_len + extend + 1,"*value");
+          capacity = extend + 1;
+          *value = db2alloc (capacity,"*value");
         } else {
           *value = NULL;
           db2Debug3("not allocating space since the LOB value is apparently NULL");
         }
       } else {
-        // reserve a byte for the 0 termination again: realloc gives back a
-        // buffer sized to exactly what we ask for, it does not carry over
-        // the spare byte reserved by the first db2alloc call above
-        *value = db2realloc (*value_len + extend + 1, *value, "*value");
+        /*
+         * Grow the buffer geometrically.  Reallocating to the exact needed
+         * size for every chunk copies the whole buffer each time, which makes
+         * reading a large LOB O(n^2) in the number of chunks (a 10MB CLOB read
+         * in 8KB chunks performed ~1200 reallocs moving ~6GB in total).
+         * Doubling the capacity amortizes this to O(n) copies.  The capacity
+         * always covers the data read so far plus one byte for the 0
+         * termination, which the first db2alloc call reserved.
+         */
+        if (*value_len + extend + 1 > capacity) {
+          capacity *= 2;
+          if (capacity < *value_len + extend + 1)
+            capacity = *value_len + extend + 1;
+          *value = db2realloc (capacity, *value, "*value");
+        }
       }
       // append the buffer read to the value excluding 0 termination byte
       db2Debug2("*value    : %x", *value);
