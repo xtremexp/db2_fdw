@@ -108,17 +108,14 @@ static void db2PopulateFdwStateNew(PlannerInfo* root, RelOptInfo* baserel, Oid f
   apply_server_options(fpinfo);
   apply_table_options(fpinfo);
 
-  /* If the table or the server is configured to use remote estimates, identify which user to do remote access as during planning.
-   * This should match what ExecCheckPermissions() does. If we fail due to lack of permissions, the query would have failed at runtime anyway.
+  /*
+   * Remote estimation is not implemented in db2_fdw: the former code path
+   * deparsed an EXPLAIN query but never executed it and then used
+   * uninitialized cost variables.  Always fall back to local estimation and
+   * ignore the option (it is still accepted for backward compatibility).
    */
-  if (fpinfo->use_remote_estimate) {
-    Oid userid;
-
-    userid        = OidIsValid(baserel->userid) ? baserel->userid : GetUserId();
-    fpinfo->fuser = GetUserMapping(userid, fpinfo->fserver->serverid);
-  } else {
-    fpinfo->fuser = NULL;
-  }
+  fpinfo->use_remote_estimate = false;
+  fpinfo->fuser = NULL;
 
    /* Identify which baserestrictinfo clauses can be sent to the remote server and which can't. */
   classifyConditions(root, baserel, baserel->baserestrictinfo, &fpinfo->remote_conds, &fpinfo->local_conds);
@@ -149,25 +146,15 @@ static void db2PopulateFdwStateNew(PlannerInfo* root, RelOptInfo* baserel, Oid f
   fpinfo->rel_startup_cost  = -1;
   fpinfo->rel_total_cost    = -1;
 
-  /* If the table or the server is configured to use remote estimates, connect to the foreign server and execute EXPLAIN to estimate the
-   * number of rows selected by the restriction clauses, as well as the average row width.  Otherwise, estimate using whatever statistics we
-   * have locally, in a way similar to ordinary tables.
+  /* Estimate rows and costs using whatever statistics we have locally, in a way similar to ordinary tables.
+   * (Remote estimation is not supported; see the comment above.)
    */
-  if (fpinfo->use_remote_estimate) {
-    /* Get cost/size estimates with help of remote server.
-     * Save the values in fpinfo so we don't need to do it again to generate the basic foreign path.
-     */
-    estimate_path_cost_size(root, baserel, NIL, NIL, NULL, &fpinfo->rows, &fpinfo->width, &fpinfo->disabled_nodes, &fpinfo->startup_cost, &fpinfo->total_cost);
-
-    /* Report estimated baserel size to planner. */
-    baserel->rows = fpinfo->rows;
-    baserel->reltarget->width = fpinfo->width;
-  } else {
+  {
     /* If the foreign table has never been ANALYZEd, it will have reltuples < 0, meaning "unknown".
-     * We can't do much if we're not allowed to consult the remote server, but we can use a hack similar 
-     * to plancat.c's treatment of empty relations: use a minimum size estimate of 10 pages, and divide by 
-     * the column-datatype-based width estimate to get the corresponding number of tuples.
-     */
+      * We can't do much if we're not allowed to consult the remote server, but we can use a hack similar
+      * to plancat.c's treatment of empty relations: use a minimum size estimate of 10 pages, and divide by
+      * the column-datatype-based width estimate to get the corresponding number of tuples.
+      */
     if (baserel->tuples < 0) {
       baserel->pages  = 10;
       baserel->tuples = (10 * BLCKSZ) / (baserel->reltarget->width + MAXALIGN(SizeofHeapTupleHeader));

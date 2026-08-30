@@ -968,75 +968,15 @@ void estimate_path_cost_size(PlannerInfo* root, RelOptInfo* foreignrel, List* pa
   /* Make sure the core code has set up the relation's reltarget */
   Assert(foreignrel->reltarget);
 
-  /* If the table or the server is configured to use remote estimates, connect to the foreign server and execute EXPLAIN to estimate the
-   * number of rows selected by the restriction+join clauses.
-   * Otherwise, estimate rows using whatever statistics we have locally, in a way similar to ordinary tables.
+  /* Remote estimation is not implemented in db2_fdw (the former code path
+   * deparsed an EXPLAIN query but never executed it and then used the
+   * uninitialized variables rows/startup_cost/total_cost below).  Always
+   * estimate rows using whatever statistics we have locally, in a way similar
+   * to ordinary tables.  use_remote_estimate is forced to false by
+   * db2GetForeignRelSize(), so the former branch was dead code reading
+   * uninitialized memory; it has been removed.
    */
-  if (fpinfo->use_remote_estimate) {
-    List*           remote_param_join_conds;
-    List*           local_param_join_conds;
-    StringInfoData  sql;
-//    PGconn*         conn;
-    Selectivity     local_sel;
-    QualCost        local_cost;
-    List*           fdw_scan_tlist = NIL;
-    List*           remote_conds;
-    List*           retrieved_attrs;              /* Required only to be passed to deparseSelectStmtForRel */
-    /* param_join_conds might contain both clauses that are safe to send across, and clauses that aren't. */
-    classifyConditions(root, foreignrel, param_join_conds, &remote_param_join_conds, &local_param_join_conds);
-
-    /* Build the list of columns to be fetched from the foreign server. */
-    fdw_scan_tlist = (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel)) ? build_tlist_to_deparse(root, foreignrel) : NIL;
-
-    /* The complete list of remote conditions includes everything from baserestrictinfo plus any extra join_conds relevant to this
-     * particular path.
-     */
-    remote_conds = list_concat(remote_param_join_conds, fpinfo->remote_conds);
-
-    /* Construct EXPLAIN query including the desired SELECT, FROM, and WHERE clauses. Params and other-relation Vars are replaced by dummy
-     * values, so don't request params_list.
-     */
-    initStringInfo(&sql);
-    appendStringInfoString(&sql, "EXPLAIN ");
-    deparseSelectStmtForRel( &sql, root, foreignrel, fdw_scan_tlist, remote_conds, pathkeys
-                           , fpextra ? fpextra->has_final_sort : false
-                           , fpextra ? fpextra->has_limit      : false
-                           , false, &retrieved_attrs, NULL);
-
-    /* Get the remote estimate */
-//    conn = GetConnection(fpinfo->user, false, NULL);
-//    get_remote_estimate(sql.data, conn, &rows, &width, &startup_cost, &total_cost);
-//    ReleaseConnection(conn);
-    retrieved_rows = rows;
-
-    /* Factor in the selectivity of the locally-checked quals */
-    local_sel  = clauselist_selectivity(root, local_param_join_conds, foreignrel->relid, JOIN_INNER, NULL);
-    local_sel *= fpinfo->local_conds_sel;
-    rows       = clamp_row_est(rows* local_sel);
-
-    /* Add in the eval cost of the locally-checked quals */
-    startup_cost += fpinfo->local_conds_cost.startup;
-    total_cost   += fpinfo->local_conds_cost.per_tuple * retrieved_rows;
-    cost_qual_eval(&local_cost, local_param_join_conds, root);
-    startup_cost += local_cost.startup;
-    total_cost   += local_cost.per_tuple * retrieved_rows;
-
-    /* Add in tlist eval cost for each output row.  In case of an aggregate, some of the tlist expressions such as grouping
-     * expressions will be evaluated remotely, so adjust the costs.
-     */
-    startup_cost += foreignrel->reltarget->cost.startup;
-    total_cost   += foreignrel->reltarget->cost.startup;
-    total_cost   += foreignrel->reltarget->cost.per_tuple * rows;
-    if (IS_UPPER_REL(foreignrel)) {
-      QualCost	tlist_cost;
-
-      cost_qual_eval(&tlist_cost, fdw_scan_tlist, root);
-
-      startup_cost -= tlist_cost.startup;
-      total_cost   -= tlist_cost.startup;
-      total_cost   -= tlist_cost.per_tuple * rows;
-    }
-  } else {
+  {
     Cost    run_cost = 0;
 
     /* We don't support join conditions in this mode (hence, no parameterized paths can be made). */
