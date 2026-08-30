@@ -283,16 +283,26 @@ void convertTuple (DB2Session* session, DB2ResultColumn* reslist, DB2TupleIndexM
         values[j] = PointerGetDatum (result);
       } else {
         regproc   typinput;
-        HeapTuple tuple;
         Datum     dat;
         db2Debug5("pgtype: %d",res->pgtype);
-        /* find the appropriate conversion function */
-        tuple = SearchSysCache1 (TYPEOID, ObjectIdGetDatum (res->pgtype));
-        if (!HeapTupleIsValid (tuple)) {
-          elog (ERROR, "cache lookup failed for type %u", res->pgtype);
+        /* find the appropriate conversion function
+         * The type's input function is resolved once per result column and
+         * cached in the column descriptor; doing the syscache lookup for every
+         * row and column is measurable overhead for wide tables.
+         */
+        if (res->typinput == InvalidOid) {
+          HeapTuple tuple;
+
+          tuple = SearchSysCache1 (TYPEOID, ObjectIdGetDatum (res->pgtype));
+          if (!HeapTupleIsValid (tuple)) {
+            elog (ERROR, "cache lookup failed for type %u", res->pgtype);
+          }
+          typinput = ((Form_pg_type) GETSTRUCT (tuple))->typinput;
+          ReleaseSysCache (tuple);
+          res->typinput = typinput;
+        } else {
+          typinput = res->typinput;
         }
-        typinput = ((Form_pg_type) GETSTRUCT (tuple))->typinput;
-        ReleaseSysCache (tuple);
         dat = CStringGetDatum (value);
         db2Debug5("CStringGetDatum(%s): %d",value, dat);
   

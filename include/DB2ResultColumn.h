@@ -55,6 +55,7 @@ typedef struct db2ResultColumn {
   int                     pgattnum;      // PG attribute number
   Oid                     pgtype;        // PG data type
   int                     pgtypmod;      // PG type modifier
+  Oid                     typinput;      // cached OID of the PG type input function (InvalidOid until first use)
   int                     pkey;          // nonzero for primary keys, later set to the resjunk attribute number
   int                     resnum;        // position of result in cursor 1 based
   char*                   val;           // buffer for DB2 to return results in (LOB locator for LOBs)
